@@ -55,7 +55,12 @@ from tools import glkb_tools, pubmed_tools
 # -----------------------------------------
 # Model
 # -----------------------------------------
-LLM_MODEL = LiteLlm(model="openai/gpt-5.2")
+# Override via LLM_MODEL env var. Examples:
+#   openai/gpt-5.2                          (default, requires OPENAI_API_KEY)
+#   openrouter/openai/gpt-4o-mini:free      (requires OPENROUTER_API_KEY)
+#   openrouter/<provider>/<model>:free      (any OpenRouter model)
+_model_name = os.getenv("LLM_MODEL", "openai/gpt-5.2")
+LLM_MODEL = LiteLlm(model=_model_name)
 
 # -----------------------------------------
 # Skill Loading Helper

@@ -20,12 +20,16 @@ from typing import Literal, Optional, List
 
 from dotenv import load_dotenv
 from google.adk.tools import FunctionTool
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters, StdioConnectionParams
-from neo4j import GraphDatabase, READ_ACCESS
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Use the shared agent logger (propagate=False, immune to root-logger reconfig)
 logger = logging.getLogger("glkb_agent_service")
+
+# -----------------------------------------
+# GLKB API Configuration
+# -----------------------------------------
+
+GLKB_API_URL = os.getenv("GLKB_API_URL", "https://glkb.dcmb.med.umich.edu/api")
 
 # -----------------------------------------
 # Logging Decorator for Tools
@@ -58,17 +62,11 @@ def log_tool_call(func):
             raise
     return wrapper
 
-def get_neo4j_driver():
-    """Get a Neo4j driver instance."""
-    return GraphDatabase.driver(os.getenv("NEO4J_URI"), auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")))
-
-CYPHER_QUERY_TIMEOUT = 30  # seconds — kill queries that take longer than this
-CYPHER_MAX_ROWS = 500      # hard cap on returned rows
+CYPHER_MAX_ROWS = 500      # hard cap on returned rows — results are sliced after fetch
 CYPHER_DEFAULT_LIMIT = 50  # injected when query has no LIMIT clause
 
 def _has_limit(query: str) -> bool:
     """Check if a Cypher query already contains a LIMIT clause."""
-    # Strip string literals to avoid false positives
     stripped = re.sub(r"'[^']*'|\"[^\"]*\"", "", query)
     return bool(re.search(r'\bLIMIT\b', stripped, re.IGNORECASE))
 
@@ -78,43 +76,51 @@ def _inject_limit(query: str, limit: int = CYPHER_DEFAULT_LIMIT) -> str:
         return query
     return f"{query.rstrip().rstrip(';')}\nLIMIT {limit}"
 
-def _check_explain(session, query: str, parameters: dict) -> Optional[str]:
-    """Run EXPLAIN and warn about cartesian products or missing index usage."""
-    try:
-        result = session.run(f"EXPLAIN {query}", parameters)
-        plan = result.consume().plan
-        if plan is None:
-            return None
-        warnings = []
-        # Walk the plan tree for CartesianProduct operators
-        stack = [plan]
-        while stack:
-            node = stack.pop()
-            op = getattr(node, 'operator_type', '') or ''
-            if 'CartesianProduct' in op:
-                warnings.append("Query plan contains a CartesianProduct — this can be extremely slow on large graphs.")
-            children = getattr(node, 'children', []) or []
-            stack.extend(children)
-        return "; ".join(warnings) if warnings else None
-    except Exception:
-        return None  # don't block execution if EXPLAIN itself fails
+def _inline_cypher_params(query: str, params: dict) -> str:
+    """Inline a parameter dict into a Cypher query string.
 
-def run_cypher_query(query: str, parameters: dict = None, timeout: int = CYPHER_QUERY_TIMEOUT) -> list:
-    """Execute a Cypher query with timeout and row cap. Returns list of dicts."""
-    driver = get_neo4j_driver()
-    try:
-        with driver.session(database=os.getenv("NEO4J_DATABASE"), default_access_mode=READ_ACCESS) as session:
-            with session.begin_transaction(timeout=timeout) as tx:
-                result = tx.run(query, parameters or {})
-                rows = []
-                for record in result:
-                    rows.append(record.data())
-                    if len(rows) >= CYPHER_MAX_ROWS:
-                        break
-                tx.commit()
-                return rows
-    finally:
-        driver.close()
+    The GLKB API does not support parameterized queries, so all $param
+    placeholders are replaced with literal values before sending.
+    """
+    for key, value in params.items():
+        placeholder = f"${key}"
+        if isinstance(value, str):
+            escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+            replacement = f"'{escaped}'"
+        elif isinstance(value, list):
+            items = []
+            for item in value:
+                if isinstance(item, str):
+                    escaped = item.replace("\\", "\\\\").replace("'", "\\'")
+                    items.append(f"'{escaped}'")
+                else:
+                    items.append(str(item))
+            replacement = f"[{', '.join(items)}]"
+        elif isinstance(value, bool):
+            replacement = "true" if value else "false"
+        elif value is None:
+            replacement = "null"
+        else:
+            replacement = str(value)
+        query = query.replace(placeholder, replacement)
+    return query
+
+async def _glkb_cypher(query: str, params: dict = None) -> list:
+    """Execute a Cypher query via the GLKB HTTP API.
+
+    Returns a list of dicts, one per result row (column aliases become dict keys).
+    Raises httpx.HTTPStatusError on non-2xx responses.
+    """
+    if params:
+        query = _inline_cypher_params(query, params)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{GLKB_API_URL}/others/_cypher_query",
+            json={"cypher": query},
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        return result if isinstance(result, list) else []
 
 @log_tool_call
 async def get_database_schema() -> str:
@@ -195,15 +201,14 @@ async def article_search(
             }
         if keywords:
             if prioritize_recent:
-                order_by = """ORDER BY 
+                order_by = """ORDER BY
     log(1 + 5 * score) +
     log(1 + a.n_citation) * exp(-0.05 * (date().year - a.pubdate)) +
     (0.5 * j.impact_factor) * exp(-0.20 * (date().year - a.pubdate)) +
     2.0 * exp(-0.10 * (date().year - a.pubdate))
 DESC"""
             else:
-                order_by = "order by log(1+5*score) + log(1+a.n_citation) + 0.5*j.impact_factor*exp(-0.15*date().year-a.pubdate) desc"
-            # Build the Cypher query
+                order_by = "ORDER BY log(1+5*score) + log(1+a.n_citation) + 0.5*j.impact_factor*exp(-0.15*date().year-a.pubdate) DESC"
             query = f"""
             CALL db.index.fulltext.queryNodes("article_Title", $keywords) YIELD node, score WITH node as a, score LIMIT 100
             WITH a, score
@@ -212,7 +217,7 @@ DESC"""
             {order_by} LIMIT $limit
             """
             params = {"keywords": ' '.join(keywords), "limit": limit}
-            results = run_cypher_query(query, params)
+            results = await _glkb_cypher(query, params)
             return {
                 "success": True,
                 "keywords": keywords,
@@ -220,12 +225,12 @@ DESC"""
                 "results": results
             }
         elif pubmed_ids:
-            # Build the Cypher query
-            query = f"""
-            MATCH (a:Article) WHERE a.pubmedid IN $pubmed_ids RETURN a.pubmedid as pubmedid, a.n_citation as n_citation, a.pubdate as pubdate, a.title as title, a.abstract as abstract, a.journal as journal, a.authors as authors
+            query = """
+            MATCH (a:Article) WHERE a.pubmedid IN $pubmed_ids
+            RETURN a.pubmedid as pubmedid, a.n_citation as n_citation, a.pubdate as pubdate, a.title as title, a.abstract as abstract, a.journal as journal, a.authors as authors
             """
             params = {"pubmed_ids": pubmed_ids}
-            results = run_cypher_query(query, params)
+            results = await _glkb_cypher(query, params)
             return {
                 "success": True,
                 "pubmed_ids": pubmed_ids,
@@ -258,13 +263,13 @@ async def vocabulary_search(name: str, limit: int = 5) -> dict:
         CALL db.index.fulltext.queryNodes("vocabulary_Names", $name) YIELD node, score WITH node as n, score LIMIT 30 WHERE n.connected is not null RETURN n.id as id, n.name as name, n.n_citation as n_citation, n.description as description ORDER BY CASE WHEN n.n_citation IS NOT NULL THEN n.n_citation ELSE 0 END DESC
         """
         params = {"name": name}
-        results = run_cypher_query(query, params)
+        results = await _glkb_cypher(query, params)
 
         query = """
         MATCH (v:Vocabulary)-[:OntologyMapping]-(v2:Vocabulary) WHERE v.id IN $ids RETURN v2.id as id, v2.name as name, v2.n_citation as n_citation, v2.description as description ORDER BY CASE WHEN v2.n_citation IS NOT NULL THEN v2.n_citation ELSE 0 END DESC
         """
         params = {"ids": [result["id"] for result in results]}
-        related_vocabulary = run_cypher_query(query, params)
+        related_vocabulary = await _glkb_cypher(query, params)
         # remove duplicates
         for result in related_vocabulary:
             if result["id"] not in [result["id"] for result in results]:
@@ -358,7 +363,7 @@ async def execute_cypher(query: str) -> dict:
     - NEVER use variable-length paths of unbounded depth (e.g., [*] or [*..10]). Use fixed depth like [*1..2].
     - USE specific node labels (e.g., :Gene, :Article) instead of unlabeled () patterns.
     - USE parameterized WHERE clauses to leverage indexes (e.g., WHERE v.name = 'TP53').
-    - Queries are killed after 30 seconds. If your query times out, simplify it.
+    - Queries time out after 60 seconds. If your query times out, simplify it.
 
     Args:
         query: A Cypher query string (read-only, no CREATE/DELETE/SET)
@@ -397,71 +402,28 @@ async def execute_cypher(query: str) -> dict:
     limit_injected = query != original_query
 
     try:
-        # Run EXPLAIN check first for cartesian products
-        driver = get_neo4j_driver()
-        warning = None
-        try:
-            with driver.session(database=os.getenv("NEO4J_DATABASE"), default_access_mode=READ_ACCESS) as session:
-                warning = _check_explain(session, query, {})
-        finally:
-            driver.close()
-
-        if warning and "CartesianProduct" in warning:
-            return {
-                "success": False,
-                "query": query,
-                "error": f"Query rejected: {warning} Rewrite the query to use explicit joins (e.g., WHERE a.id = b.id) or connected patterns."
-            }
-
-        # Execute with timeout
-        results = await asyncio.to_thread(run_cypher_query, query)
+        results = await _glkb_cypher(query)
+        results = results[:CYPHER_MAX_ROWS]
         response = {
             "success": True,
             "count": len(results),
             "results": results,
         }
-        if warning:
-            response["warning"] = warning
         if limit_injected:
             response["note"] = f"LIMIT {CYPHER_DEFAULT_LIMIT} was added to your query. Add an explicit LIMIT to control result size."
         if len(results) >= CYPHER_MAX_ROWS:
-            response["note"] = f"Results truncated at {CYPHER_MAX_ROWS} rows. Add a tighter LIMIT or more specific WHERE clause."
+            response["note"] = f"Results capped at {CYPHER_MAX_ROWS} rows. Add a tighter LIMIT or more specific WHERE clause."
         return response
 
     except Exception as e:
-        error_str = str(e)
-        if "timeout" in error_str.lower() or "terminated" in error_str.lower():
-            return {
-                "success": False,
-                "query": query,
-                "error": f"Query timed out after {CYPHER_QUERY_TIMEOUT}s. The query is too expensive — simplify it by adding stricter WHERE filters, using specific node labels, or reducing LIMIT."
-            }
         return {
             "success": False,
             "query": query,
-            "error": f"Query failed: {error_str}"
+            "error": f"Query failed: {str(e)}"
         }
 
 
-### NEO4J MCP TOOLSET (for agent-based access) ###
-neo4j_toolset = MCPToolset(
-    connection_params=StdioConnectionParams(
-        server_params=StdioServerParameters(
-            command="/opt/neo4j/neo4j-mcp/neo4j-mcp",
-            args=[
-                "--neo4j-uri", os.getenv("NEO4J_URI"),
-                "--neo4j-username", os.getenv("NEO4J_USER"),
-                "--neo4j-password", os.getenv("NEO4J_PASSWORD"),
-                "--neo4j-database", os.getenv("NEO4J_DATABASE"),
-                "--neo4j-read-only", "true",
-                "--neo4j-schema-sample-size", "20"
-            ]
-        )
-    ),
-    tool_filter=['get_neo4j_schema', 'read_neo4j_cypher']
-)
-
-# Create FunctionTools for Neo4j direct access
+# Create FunctionTools for GLKB knowledge graph access
 article_search_tool = FunctionTool(article_search)
 vocabulary_search_tool = FunctionTool(vocabulary_search)
 execute_cypher_tool = FunctionTool(execute_cypher)

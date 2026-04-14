@@ -1,18 +1,17 @@
-"""List available tools from Neo4j MCP server."""
+"""List available GLKB tools."""
 import asyncio
-from tools import neo4j_toolset
+from tools import glkb_tools, pubmed_tools
 
-async def list_tools():
-    print("Loading MCP tools...")
-    tools = await neo4j_toolset.load_tools()
-    print(f"\n=== Available MCP Tools ({len(tools)}) ===")
-    for tool in tools:
+def list_tools():
+    all_tools = glkb_tools + pubmed_tools
+    print(f"\n=== Available Tools ({len(all_tools)}) ===")
+    for tool in all_tools:
         name = getattr(tool, 'name', getattr(tool, '_name', str(tool)))
         desc = getattr(tool, 'description', '')[:100] if hasattr(tool, 'description') else ''
         print(f"  - {name}")
         if desc:
             print(f"    {desc}")
-    return tools
+    return all_tools
 
 if __name__ == "__main__":
-    asyncio.run(list_tools())
+    list_tools()
