@@ -17,6 +17,7 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.skills import Skill
 from google.adk.skills.models import Frontmatter, Resources
 from google.adk.tools.skill_toolset import SkillToolset
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters, StdioConnectionParams
 import dotenv
 
 dotenv.load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -101,6 +102,41 @@ def load_skill_from_directory(skill_dir: Path) -> Skill:
     )
 
 # -----------------------------------------
+# LayerMem Memory Toolset (optional)
+# -----------------------------------------
+# Disabled by default. Set LAYERMEM_ENABLED=true in .env to enable.
+_LAYERMEM_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "layerwise_memory")
+)
+_layermem_snapshot = os.path.abspath(os.getenv(
+    "LAYERMEM_SNAPSHOT_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "agent_logs", "layermem_snapshot.json"),
+))
+
+memory_toolset = None
+if os.getenv("LAYERMEM_ENABLED", "false").lower() == "true":
+    memory_toolset = MCPToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(
+                command=sys.executable,
+                args=[os.path.join(_LAYERMEM_DIR, "mcp_server.py")],
+                env={
+                    **os.environ,
+                    "MCP_SNAPSHOT_PATH": _layermem_snapshot,
+                    "MODEL_API_KEY": os.getenv("OPENROUTER_API_KEY", os.getenv("OPENAI_API_KEY", "")),
+                    "PROMPT_MODE": "conversational",
+                },
+                cwd=_LAYERMEM_DIR,
+            ),
+            timeout=30.0,
+        ),
+        tool_filter=["add_content", "query", "sleep_update", "save_snapshot", "get_status"],
+    )
+    logger.info(f"LayerMem memory enabled (snapshot: {_layermem_snapshot})")
+else:
+    logger.info("LayerMem memory disabled (set LAYERMEM_ENABLED=true to enable)")
+
+# -----------------------------------------
 # Load Skills
 # -----------------------------------------
 SKILLS_DIR = Path(__file__).parent / "skills"
@@ -168,5 +204,6 @@ root_agent = LlmAgent(
         *glkb_tools,
         *pubmed_tools,
         SkillToolset(skills=[kg_skill, lit_skill]),
+        *([memory_toolset] if memory_toolset else []),
     ],
 )
