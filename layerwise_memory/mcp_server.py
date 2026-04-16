@@ -39,6 +39,9 @@ from config import async_client
 
 SNAPSHOT_PATH = os.getenv("MCP_SNAPSHOT_PATH", "mem_snapshot_mcp.json")
 
+# Number of pending sources before sleep_update runs automatically after add_content
+SLEEP_THRESHOLD = 5
+
 # ---------------------------------------------------------------------------
 # Load or initialise memory at startup
 # ---------------------------------------------------------------------------
@@ -70,9 +73,8 @@ async def list_tools() -> list[types.Tool]:
                 "- 'conversation': persona summaries for each speaker are updated during sleep_update.\n"
                 "- 'document': a task rubric (output format instructions) is generated for the document "
                 "type during sleep_update.\n\n"
-                "Typical workflow: call add_content one or more times, then call sleep_update once "
-                "to build connections and refresh metadata. Do not call sleep_update after every "
-                "single add_content — batch ingestions first."
+                "sleep_update runs automatically after enough items accumulate (server-managed). "
+                "You do not need to call sleep_update manually after add_content."
             ),
             inputSchema={
                 "type": "object",
@@ -258,10 +260,17 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             timestamp=arguments.get("timestamp"),
             chunk=arguments.get("chunk", True),
         )
+        pending = len(mem._convs_since_sleep) + len(mem._docs_since_sleep)
+        sleep_ran = False
+        if pending >= SLEEP_THRESHOLD:
+            await mem.sleep_update_async()
+            sleep_ran = True
         result = {
             "status": "ok",
             "source_id": arguments["source_id"],
             "trajectory_count": len(mem.source_registry.get(arguments["source_id"], [])),
+            "pending_sleep": 0 if sleep_ran else pending,
+            "sleep_update_ran": sleep_ran,
         }
         return [types.TextContent(type="text", text=json.dumps(result))]
 
