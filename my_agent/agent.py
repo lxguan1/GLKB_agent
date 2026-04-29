@@ -116,14 +116,12 @@ MEMORY_DB_PATH = os.getenv(
     "LAYERMEM_DB_PATH",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agent_logs", "layermem.db")),
 )
-BUFFER_THRESHOLD_TOKENS = 800     # flush when buffered turns exceed this
-CONSOLIDATE_EVERY_N_FLUSHES = 5   # run sleep_update every N flushes
+CONSOLIDATE_EVERY_N_FLUSHES = 10   # run sleep_update every N flushes
 
 _LAYERMEM_ENABLED = os.getenv("LAYERMEM_ENABLED", "false").lower() == "true"
 
 mem = None
 _session_id = f"session_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}"
-_buffer_tokens: int = 0
 _flush_count: int = 0
 
 if _LAYERMEM_ENABLED:
@@ -132,6 +130,7 @@ if _LAYERMEM_ENABLED:
     os.environ.setdefault("PROMPT_MODE", "conversational")
 
     from agent_memory import ConversationMemory, ModifiedMemory, load_from_sqlite
+    from config import async_client as _mem_async_client, LLM_MODEL as _mem_llm_model  # type: ignore[import]
 
     _mem_inner = load_from_sqlite(MEMORY_DB_PATH) if os.path.exists(MEMORY_DB_PATH) else ModifiedMemory()
     mem = ConversationMemory(_mem_inner, MEMORY_DB_PATH)
@@ -140,15 +139,71 @@ else:
     logger.info("LayerMem disabled (set LAYERMEM_ENABLED=true to enable)")
 
 
-def _approx_tokens(text: str) -> int:
-    return len(text) // 4
+AGENT_TEXT_LIMIT = 300  # chars of agent text included in boundary check prompt
+
+
+def _truncate_turn(lines: list) -> str:
+    parts = []
+    for line in lines:
+        if line.startswith("GLKBAgent:") and len(line) > 10 + AGENT_TEXT_LIMIT:
+            line = line[:10 + AGENT_TEXT_LIMIT] + "..."
+        parts.append(line)
+    return "\n".join(parts)
+
+
+async def _is_boundary(buffer_lines: list) -> bool:
+    """Ask the LLM if the most recent turn is a topic shift from the buffered episode."""
+    prior = "\n".join(_truncate_turn([l]) for l in buffer_lines[:-2])
+    latest = _truncate_turn(buffer_lines[-2:])
+    try:
+        response = await _mem_async_client.chat.completions.create(  # type: ignore[name-defined]
+            model=_mem_llm_model,  # type: ignore[name-defined]
+            messages=[{
+                "role": "user",
+                "content": (
+                    "You are a conversation segmentation assistant for a biomedical research assistant.\n\n"
+                    "Current episode:\n"
+                    f"{prior}\n\n"
+                    "New turn:\n"
+                    f"{latest}\n\n"
+                    "Reply YES only if the new turn switches to a completely unrelated biomedical subject "
+                    "(e.g. an entirely different gene, disease, or research area with no connection to the episode above). "
+                    "Follow-up questions, clarifications, related entities, or deeper dives into the same subject are NO. "
+                    "When in doubt, reply NO. Reply YES or NO only."
+                ),
+            }],
+            max_tokens=5,
+            temperature=0,
+        )
+        answer = (response.choices[0].message.content or "").strip().upper()
+        return answer.startswith("YES")
+    except Exception as e:
+        logger.warning(f"Episode boundary check failed, keeping current episode: {e}")
+        return False
+
+
+async def _flush_keep_last_turn() -> None:
+    """Flush all turns except the most recent into an episode; latest turn seeds the new episode."""
+    global _flush_count
+    all_lines = list(mem._turn_buffers.get(_session_id, []))  # type: ignore[union-attr]
+    if len(all_lines) < 4:
+        return
+    to_flush = all_lines[:-2]
+    mem._turn_buffers[_session_id] = all_lines[-2:]  # type: ignore[union-attr]
+    content = "\n".join(to_flush)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    _flush_count += 1
+    source_id = f"{_session_id}_part{_flush_count}"
+    ingestion = mem._mem.add_content_async(content, source_id, "conversation", timestamp, False)
+    asyncio.create_task(ingestion)
+    if _flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
+        asyncio.create_task(mem.consolidate())
 
 
 async def _trigger_flush(wait: bool = False) -> None:
     """Pop the turn buffer and ingest. Background by default; await if wait=True."""
-    global _buffer_tokens, _flush_count
+    global _flush_count
     lines = mem._turn_buffers.pop(_session_id, [])
-    _buffer_tokens = 0
     if not lines:
         return
     content = "\n".join(lines)
@@ -165,9 +220,8 @@ async def _trigger_flush(wait: bool = False) -> None:
 
 
 async def _memory_after_agent_callback(callback_context) -> None:
-    """Auto-buffer each turn and flush to LayerMem when threshold is reached."""
-    global _buffer_tokens
-    if not _LAYERMEM_ENABLED:
+    """Auto-buffer each turn; flush to LayerMem when LLM detects a topic shift."""
+    if not _LAYERMEM_ENABLED or mem is None:
         return None
 
     user_text = ""
@@ -188,22 +242,17 @@ async def _memory_after_agent_callback(callback_context) -> None:
     if not user_text and not agent_text:
         return None
 
-    turn_tokens = _approx_tokens(user_text + agent_text)
-
-    # Flush before adding if threshold would be crossed
-    if _buffer_tokens > 0 and _buffer_tokens + turn_tokens >= BUFFER_THRESHOLD_TOKENS:
-        await _trigger_flush()
-
-    logger.debug(f"Memory buffer | user={len(user_text)}chars agent={len(agent_text)}chars turn_tokens~{turn_tokens}")
     if user_text:
         mem.add_turn("User", user_text, session_id=_session_id)
     if agent_text:
         mem.add_turn("GLKBAgent", agent_text, session_id=_session_id)
-    _buffer_tokens += turn_tokens
 
-    # Flush if a single turn alone exceeds threshold
-    if _buffer_tokens >= BUFFER_THRESHOLD_TOKENS:
-        await _trigger_flush()
+    logger.debug(f"Memory buffer | user={len(user_text)}chars agent={len(agent_text)}chars")
+
+    buffer_lines = mem._turn_buffers.get(_session_id, [])  # type: ignore[union-attr]
+    if len(buffer_lines) >= 4 and await _is_boundary(buffer_lines):
+        logger.info("Episode boundary detected — flushing buffer, keeping latest turn")
+        await _flush_keep_last_turn()
 
     return None
 
