@@ -425,7 +425,7 @@ Recent conversations:
 
 Instructions:
 1. Identify every distinct participant / speaker in the conversations (e.g. "Alice", "Bob", "User", "Assistant", or any name/role that appears).
-2. For each participant, write or update a persona summary that captures their interests, background, preferences, personality, and communication style as revealed by the conversations.
+2. For each participant, write or update a persona summary that captures their identity, interests, background, preferences, personality, and communication style as revealed by the conversations.
 3. Each individual summary must be at most 100 words.
 4. Only update a participant's summary if the new conversations add meaningful information.
 5. Preserve participants from the current summaries even if they do not appear in the new conversations.

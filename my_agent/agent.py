@@ -8,16 +8,21 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import asyncio
 import logging
-import os
 import yaml
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+
 from google.adk.agents import LlmAgent
+from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.skills import Skill
 from google.adk.skills.models import Frontmatter, Resources
+from google.adk.tools.base_toolset import BaseToolset
 from google.adk.tools.skill_toolset import SkillToolset
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters, StdioConnectionParams
+from google.adk.tools import FunctionTool
 import dotenv
 
 dotenv.load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -102,39 +107,140 @@ def load_skill_from_directory(skill_dir: Path) -> Skill:
     )
 
 # -----------------------------------------
-# LayerMem Memory Toolset (optional)
+# Memory (LayerMem — direct integration)
 # -----------------------------------------
-# Disabled by default. Set LAYERMEM_ENABLED=true in .env to enable.
-_LAYERMEM_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "layerwise_memory")
-)
-_layermem_snapshot = os.path.abspath(os.getenv(
-    "LAYERMEM_SNAPSHOT_PATH",
-    os.path.join(os.path.dirname(__file__), "..", "agent_logs", "layermem_snapshot.json"),
-))
+# Set LAYERMEM_ENABLED=true in .env to enable.
 
-memory_toolset = None
-if os.getenv("LAYERMEM_ENABLED", "false").lower() == "true":
-    memory_toolset = MCPToolset(
-        connection_params=StdioConnectionParams(
-            server_params=StdioServerParameters(
-                command=sys.executable,
-                args=[os.path.join(_LAYERMEM_DIR, "mcp_server.py")],
-                env={
-                    **os.environ,
-                    "MCP_SNAPSHOT_PATH": _layermem_snapshot,
-                    "MODEL_API_KEY": os.getenv("OPENROUTER_API_KEY", os.getenv("OPENAI_API_KEY", "")),
-                    "PROMPT_MODE": "conversational",
-                },
-                cwd=_LAYERMEM_DIR,
-            ),
-            timeout=30.0,
-        ),
-        tool_filter=["add_content", "query", "sleep_update", "save_snapshot", "get_status"],
-    )
-    logger.info(f"LayerMem memory enabled (snapshot: {_layermem_snapshot})")
+# Hyperparameters
+MEMORY_DB_PATH = os.getenv(
+    "LAYERMEM_DB_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agent_logs", "layermem.db")),
+)
+BUFFER_THRESHOLD_TOKENS = 800     # flush when buffered turns exceed this
+CONSOLIDATE_EVERY_N_FLUSHES = 5   # run sleep_update every N flushes
+
+_LAYERMEM_ENABLED = os.getenv("LAYERMEM_ENABLED", "false").lower() == "true"
+
+mem = None
+_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}"
+_buffer_tokens: int = 0
+_flush_count: int = 0
+
+if _LAYERMEM_ENABLED:
+    _LAYERMEM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "layerwise_memory"))
+    sys.path.insert(0, _LAYERMEM_DIR)
+    os.environ.setdefault("PROMPT_MODE", "conversational")
+
+    from agent_memory import ConversationMemory, ModifiedMemory, load_from_sqlite
+
+    _mem_inner = load_from_sqlite(MEMORY_DB_PATH) if os.path.exists(MEMORY_DB_PATH) else ModifiedMemory()
+    mem = ConversationMemory(_mem_inner, MEMORY_DB_PATH)
+    logger.info(f"LayerMem enabled (db: {MEMORY_DB_PATH})")
 else:
-    logger.info("LayerMem memory disabled (set LAYERMEM_ENABLED=true to enable)")
+    logger.info("LayerMem disabled (set LAYERMEM_ENABLED=true to enable)")
+
+
+def _approx_tokens(text: str) -> int:
+    return len(text) // 4
+
+
+async def _trigger_flush(wait: bool = False) -> None:
+    """Pop the turn buffer and ingest. Background by default; await if wait=True."""
+    global _buffer_tokens, _flush_count
+    lines = mem._turn_buffers.pop(_session_id, [])
+    _buffer_tokens = 0
+    if not lines:
+        return
+    content = "\n".join(lines)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    _flush_count += 1
+    source_id = f"{_session_id}_part{_flush_count}"
+    ingestion = mem._mem.add_content_async(content, source_id, "conversation", timestamp, False)
+    if wait:
+        await ingestion
+    else:
+        asyncio.create_task(ingestion)
+    if _flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
+        asyncio.create_task(mem.consolidate())
+
+
+async def _memory_after_agent_callback(callback_context) -> None:
+    """Auto-buffer each turn and flush to LayerMem when threshold is reached."""
+    global _buffer_tokens
+    if not _LAYERMEM_ENABLED:
+        return None
+
+    user_text = ""
+    if callback_context.user_content:
+        user_text = " ".join(
+            p.text for p in (getattr(callback_context.user_content, "parts", None) or [])
+            if getattr(p, "text", None)
+        )
+
+    agent_text = ""
+    for event in reversed(callback_context.session.events):
+        if event.author == "GLKBAgent" and event.content:
+            texts = [p.text for p in (event.content.parts or []) if getattr(p, "text", None)]
+            if texts:
+                agent_text = " ".join(texts)
+                break
+
+    if not user_text and not agent_text:
+        return None
+
+    turn_tokens = _approx_tokens(user_text + agent_text)
+
+    # Flush before adding if threshold would be crossed
+    if _buffer_tokens > 0 and _buffer_tokens + turn_tokens >= BUFFER_THRESHOLD_TOKENS:
+        await _trigger_flush()
+
+    logger.debug(f"Memory buffer | user={len(user_text)}chars agent={len(agent_text)}chars turn_tokens~{turn_tokens}")
+    if user_text:
+        mem.add_turn("User", user_text, session_id=_session_id)
+    if agent_text:
+        mem.add_turn("GLKBAgent", agent_text, session_id=_session_id)
+    _buffer_tokens += turn_tokens
+
+    # Flush if a single turn alone exceeds threshold
+    if _buffer_tokens >= BUFFER_THRESHOLD_TOKENS:
+        await _trigger_flush()
+
+    return None
+
+
+async def query_memory(question: str) -> dict:
+    """Query long-term memory for relevant context from past sessions."""
+    if not _LAYERMEM_ENABLED:
+        return {"answer": "Memory is disabled. Set LAYERMEM_ENABLED=true to enable."}
+    answer = await mem.answer(question)
+    return {"answer": answer}
+
+
+async def save_memory() -> dict:
+    """Flush current buffer, consolidate memory, and persist to disk."""
+    if not _LAYERMEM_ENABLED:
+        return {"status": "disabled"}
+    await _trigger_flush(wait=True)
+    await mem.consolidate(n_questions_per_chunk=1)
+    mem.save()
+    return {"status": "ok", "path": MEMORY_DB_PATH}
+
+
+class MemoryToolset(BaseToolset):
+    """Exposes memory tools and flushes + saves on runner shutdown."""
+
+    def __init__(self):
+        super().__init__()
+
+    async def get_tools(self, readonly_context: ReadonlyContext = None) -> list:
+        return [FunctionTool(query_memory), FunctionTool(save_memory)]
+
+    async def close(self) -> None:
+        if not _LAYERMEM_ENABLED or mem is None:
+            return
+        await _trigger_flush(wait=True)
+        mem.save()
+        logger.info("Memory flushed and saved on runner close.")
 
 # -----------------------------------------
 # Load Skills
@@ -170,13 +276,10 @@ IMPORTANT:
 - If information is insufficient after querying, acknowledge limitations.
 - Kindly refuse to answer questions that are not related to biomedical research, the GLKB database, or the GLKB agent system.
 
-MEMORY WORKFLOW (when LayerMem tools are available):
-- At the start of each session, call query to check for relevant prior context before answering.
-- After every substantive exchange (significant findings, article summaries, user-provided context),
-  proactively call add_content without waiting to be asked. Use source_id format "session_YYYY-MM-DD_topic".
-  The server automatically runs sleep_update after enough items accumulate.
-- Do NOT call sleep_update manually — it is handled server-side.
-- Call save_snapshot only when the user explicitly requests it or signals the end of a session.
+MEMORY WORKFLOW:
+- At the start of each session, call query_memory to surface relevant prior context.
+- Conversation turns are saved to memory automatically — do not attempt to save them manually.
+- Call save_memory when the user ends the session or explicitly asks to save.
 
 EVIDENCE AND CITATION WORKFLOW:
 1. After gathering evidence from tools, identify the specific sentences or passages
@@ -212,6 +315,7 @@ root_agent = LlmAgent(
         *glkb_tools,
         *pubmed_tools,
         SkillToolset(skills=[kg_skill, lit_skill]),
-        *([memory_toolset] if memory_toolset else []),
+        MemoryToolset(),
     ],
+    after_agent_callback=_memory_after_agent_callback,
 )

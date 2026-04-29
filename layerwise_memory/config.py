@@ -13,7 +13,10 @@ load_dotenv()
 
 # Configuration
 USE_MOCK = os.getenv('USE_MOCK_LLM', 'false').lower() == 'true'
-API_KEY = os.getenv('MODEL_API_KEY', '')
+API_KEY = (os.getenv('MODEL_API_KEY')
+           or os.getenv('OPENROUTER_API_KEY')
+           or os.getenv('OPENAI_API_KEY')
+           or '')
 BASE_URL = "https://openrouter.ai/api/v1"
 
 # Model configuration
